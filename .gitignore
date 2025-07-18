@@ -1,2 +1,9 @@
-service_account_key.json
+venv/
 .env
+service_account_key.json
+bot.log
+__pycache__/
+*.pyc
+*.tmp
+*.log
+temp_audio/

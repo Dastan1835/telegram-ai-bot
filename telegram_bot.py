@@ -13,6 +13,7 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 import sys
 import urllib.parse
+import functools # Добавлен для использования в job_queue
 
 # Настройка логирования
 logging.basicConfig(
@@ -34,8 +35,8 @@ SERVICE_ACCOUNT_FILE = 'service_account_key.json'
 
 try:
     openai_client = OpenAI(api_key=OPENAI_API_KEY)
-    SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive',
-              'https://www.googleapis.com/auth/documents']
+    # Изменены SCOPES: 'drive' убран, 'documents' заменен на 'documents.readonly'
+    SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/documents.readonly']
     creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
     sheets_client = gspread.authorize(creds)
     docs_service = build("docs", "v1", credentials=creds)
@@ -43,12 +44,12 @@ try:
     logging.info("Подключение к Google Sheets и Docs успешно установлено")
 except Exception as e:
     logging.error(f"Ошибка подключения к Google API: {str(e)}")
-    raise
+    raise # Важно сохранить этот 'raise' для отладки начальных проблем
 
 course_cache = {'ru': [], 'ky': []}
 knowledge_base_cache = {'ru': '', 'ky': ''}
 last_cache_update = datetime.min
-CACHE_LIFETIME = timedelta(minutes=30)
+CACHE_LIFETIME = timedelta(minutes=30) # Время жизни кэша
 
 COURSE_SYNONYMS = {
     'ru': {
@@ -83,9 +84,9 @@ MESSAGES = {
         'no_course_info_available': "Информация о курсах пока недоступна в полном объеме. Сообщите администратору, чтобы он добавил курсы или уточните позже.",
         'off_topic_response': "К сожалению, я не могу помочь с этим вопросом, но могу рассказать о наших курсах в IT Run Academy. У нас есть отличные программы, которые могут вас заинтересовать. Хотите, чтобы я рассказала подробнее?",
         # Новая фраза для записи через форму
-        'enrollment_form_prompt': "Отлично! Чтобы записаться или получить подробную консультацию, пожалуйста, заполните эту форму: https://forms.gle/QkyZyuPm1SLdfEa8A . Также Вы можете лично посетить нашу академию по адресу: [Адрес академии из базы знаний]. Мы работаем [График работы из базы знаний]. Будем рады Вас видеть!",
+        'enrollment_form_prompt': "Отлично! Чтобы записаться или получить подробную консультацию, пожалуйста, заполните эту форму: [https://forms.gle/QkyZyuPm1SLdfEa8A]. Также Вы можете лично посетить нашу академию по адресу: [Адрес академии из базы знаний]. Мы работаем [График работы из базы знаний]. Будем рады Вас видеть!",
         # Новая фраза для запроса формы при отсутствии информации
-        'no_info_form_prompt': "Извините, у меня нет точной информации по вашему вопросу прямо сейчас, или я не нашла такой курс. Чтобы наши менеджеры могли связаться с вами и предоставить подробную информацию, пожалуйста, заполните эту форму: [ВАША_ССЫЛКА_НА_ФОРМУ].",
+        'no_info_form_prompt': "Извините, у меня нет точной информации по вашему вопросу прямо сейчас, или я не нашла такой курс. Чтобы наши менеджеры могли связаться с вами и предоставить подробную информацию, пожалуйста, заполните эту форму: [https://forms.gle/QkyZyuPm1SLdfEa8A].",
         # Новая фраза для приглашения на пробный урок (GPT будет использовать ее как пример)
         'trial_lesson_invite': "Также приглашаем вас на наш бесплатный пробный урок, который проводится каждую субботу. Это отличная возможность познакомиться с нами ближе!",
         # Новая фраза для вопроса после консультации
@@ -102,11 +103,12 @@ MESSAGES = {
         'openai_timeout_error': "Кечиресиз, серверге суроо-талап узак убакытты алды. Кайра аракет кылыңыз.",
         'openai_unknown_error': "Кечиресиз, ички ката кетти. Кайра аракет кылыңыз же колдоо кызматына кайрылыңыз.",
         'no_course_info_available': "Курстар жөнүндө маалымат толук жеткиликсиз. Администраторго билдириңиз же кийинчерээк тактаңыз.",
-        'off_topic_response': "Кечиресиз, бул суроого жардам бере албайм, бирок IT Run Academyдеги курстарыбыз жөнүндө айта алам. Бизде сизди кызыктыра турган сонун программалар бар. Хотите, чтобы я рассказала подробнее?",
+        # ИСПРАВЛЕНИЕ: Заменена русская фраза на кыргызскую
+        'off_topic_response': "Кечиресиз, бул суроого жардам бере албайм, бирок IT Run Academyдеги курстарыбыз жөнүндө айта алам. Бизде сизди кызыктыра турган сонун программалар бар. Кененирээк айтып берейинби?",
         # Новая фраза для записи через форму
-        'enrollment_form_prompt': "Абдан сонун! Катталуу же кененирээк кеңеш алуу үчүн, сураныч, бул форманы толтуруңуз: https://forms.gle/QkyZyuPm1SLdfEa8A . Ошондой эле сиз биздин академияга жеке өзүңүз келип кайрылсаңыз болот: [Академиянын дареги базадан]. Биз [Иш убактысы базадан] иштейбиз. Сизди күтөбүз!",
+        'enrollment_form_prompt': "Абдан сонун! Катталуу же кененирээк кеңеш алуу үчүн, сураныч, бул форманы толтуруңуз: [https://forms.gle/QkyZyuPm1SLdfEa8A] . Ошондой эле сиз биздин академияга жеке өзүңүз келип кайрылсаңыз болот: [Академиянын дареги базадан]. Биз [Иш убактысы базадан] иштейбиз. Сизди күтөбүз!",
         # Новая фраза для запроса формы при отсутствии информации
-        'no_info_form_prompt': "Кечиресиз, учурда менин сурооңуз боюнча так маалыматым жок, же мен андай курсту тапкан жокмун. Биздин менеджерлер сизге байланышып, толук маалымат бере алышы үчүн, сураныч, бул форманы толтуруңуз: [ВАША_ССЫЛКА_НА_ФОРМУ].",
+        'no_info_form_prompt': "Кечиресиз, учурда менин сурооңуз боюнча так маалыматым жок, же мен андай курсту тапкан жокмун. Биздин менеджерлер сизге байланышып, толук маалымат бере алышы үчүн, сураныч, бул форманы толтуруңуз: [https://forms.gle/QkyZyuPm1SLdfEa8A].",
         # Новая фраза для приглашения на пробный урок (GPT будет использовать ее как пример)
         'trial_lesson_invite': "Ошондой эле сизди ар ишемби сайын өтүүчү акысыз сыноо сабагыбызга чакырабыз. Бул биз менен жакындан таанышууга эң сонун мүмкүнчүлүк!",
         # Новая фраза для вопроса после консультации
@@ -118,6 +120,7 @@ MESSAGES = {
 
 
 def get_knowledge_base(lang_code):
+    """Синхронная функция для загрузки базы знаний из Google Docs."""
     doc = docs_service.documents().get(documentId=GOOGLE_DOC_ID).execute()
     content = doc.get("body").get("content")
     text = ""
@@ -130,19 +133,29 @@ def get_knowledge_base(lang_code):
     return text
 
 
+# Функция refresh_cache теперь асинхронна и использует asyncio.to_thread для блокирующих операций
 async def refresh_cache():
     global last_cache_update
     if datetime.now() - last_cache_update > CACHE_LIFETIME:
         logging.info("Обновление кэша: загрузка курсов и базы знаний.")
-        load_courses_from_sheets()
+        await asyncio.to_thread(load_courses_from_sheets) # Обертывание синхронной функции в to_thread
         for lang in ['ru', 'ky']:
-            get_knowledge_base(lang)
+            # Обертывание синхронной функции в to_thread
+            knowledge_base_cache[lang] = await asyncio.to_thread(get_knowledge_base, lang)
         last_cache_update = datetime.now()
+        logging.info("Кэш успешно обновлен.")
     else:
         logging.info("Кэш актуален, обновление не требуется.")
 
+# Функция для использования в job_queue
+async def refresh_cache_job(context: ContextTypes.DEFAULT_TYPE):
+    logging.info("Плановое обновление кэша...")
+    await refresh_cache()
+    logging.info("Плановое обновление кэша завершено.")
+
 
 def load_courses_from_sheets():
+    """Синхронная функция для загрузки курсов из Google Sheets."""
     global course_cache
     try:
         records = sheet_courses.get_all_records()
@@ -183,6 +196,7 @@ def get_system_prompt(lang_code):
     knowledge_base = knowledge_base_cache.get(lang_code, '')
     if not knowledge_base:
         logging.warning(f"База знаний для языка {lang_code} пуста в кэше. Попытка загрузки.")
+        # Использование синхронной версии напрямую, так как этот вызов не блокирует основной цикл
         knowledge_base = get_knowledge_base(lang_code)
         if not knowledge_base:
             logging.error(f"Не удалось загрузить базу знаний для языка {lang_code}.")
@@ -257,7 +271,7 @@ async def get_gpt_response(user_message, chat_history, lang_code):
     logging.info(f"Сообщения для GPT: {messages}")
 
     try:
-        response = await asyncio.to_thread(
+        response = await asyncio.to_thread( # Оборачиваем вызов OpenAI API в asyncio.to_thread
             openai_client.chat.completions.create,
             model="gpt-4o",
             messages=messages,
@@ -277,6 +291,7 @@ async def get_gpt_response(user_message, chat_history, lang_code):
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # При /start также вызываем refresh_cache, но теперь это не блокирует основной поток
     await refresh_cache()
     lang_code = detect_language(update.message.text)
     context.user_data['lang'] = lang_code
@@ -298,6 +313,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_history = context.user_data.get('chat_history', [])
     chat_history.append({"role": "user", "content": user_message})
+
+    # ДОБАВЛЕНО: Отправка индикатора "печатает..."
+    await update.message.reply_chat_action("typing")
 
     response_text = await get_gpt_response(user_message, chat_history, lang_code)
     chat_history.append({"role": "assistant", "content": response_text})
@@ -331,24 +349,28 @@ def detect_language(text):
 def main():
     logging.info("Инициализация: загрузка курсов и базы знаний.")
     try:
+        # Первоначальная загрузка данных (синхронная, может занять время при первом запуске)
         load_courses_from_sheets()
         for lang in ['ru', 'ky']:
             get_knowledge_base(lang)
         global last_cache_update
         last_cache_update = datetime.now()
     except Exception as e:
-        logging.critical(f"Критическая ошибка при первоначальной загрузке данных: {e}. Бот может работать некорректно.")
-
+        logging.critical(f"Критическая ошибка при первоначальной загрузке данных: {e}. Бот не может быть запущен.")
+        sys.exit(1) # ДОБАВЛЕНО: Завершение работы программы при критической ошибке
 
     logging.info("Бот запущен")
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # ДОБАВЛЕНО: Запуск периодического обновления кэша
+    # Обновление будет происходить каждые 20 минут, первый запуск сразу при старте
+    application.job_queue.run_repeating(refresh_cache_job, interval=timedelta(minutes=20), first=0)
+
+
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == '__main__':
     main()
-
-
-

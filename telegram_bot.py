@@ -36,378 +36,233 @@ logging.basicConfig(
         logging.StreamHandler(sys.stdout)
     ]
 )
-logger = logging.getLogger(__name__)  # Получаем логгер для использования в функциях
+logger = logging.getLogger(__name__)
 
+# Загрузка переменных окружения из .env файла
 load_dotenv()
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-GOOGLE_SHEET_COURSES_ID = os.getenv("SHEET_ID_COURSES", "1XeTe3Ihvi2N8bvo6P-yBZL2j_8L2IlvN6bOPYmCu5z8")
-GOOGLE_DOC_ID = os.getenv("DOC_ID")
 
-SERVICE_ACCOUNT_FILE = 'service_account_key.json'
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+SHEET_ID_COURSES = os.getenv('SHEET_ID_COURSES')
+DOC_ID = os.getenv('DOC_ID')
 
-try:
-    openai_client = OpenAI(api_key=OPENAI_API_KEY)
-    SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/documents.readonly']
-    creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
-    sheets_client = gspread.authorize(creds)
-    docs_service = build("docs", "v1", credentials=creds)
-    sheet_courses = sheets_client.open_by_key(GOOGLE_SHEET_COURSES_ID).worksheet("Лист1")
-    logger.info("Подключение к Google Sheets и Docs успешно установлено")
-except Exception as e:
-    logger.error(f"Ошибка подключения к Google API: {str(e)}")
-    raise
+# Проверка, что все необходимые переменные окружения загружены
+if not all([TELEGRAM_BOT_TOKEN, OPENAI_API_KEY, SHEET_ID_COURSES, DOC_ID]):
+    logger.critical("One or more environment variables are missing. Please check your .env file or Render environment settings.")
+    sys.exit(1) # Выходим, если переменные не загружены
 
-course_cache = {'ru': [], 'ky': []}
-knowledge_base_cache = {'ru': '', 'ky': ''}
-last_cache_update = datetime.min
-CACHE_LIFETIME = timedelta(minutes=30)  # Время жизни кэша
+# Инициализация OpenAI клиента
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-COURSE_SYNONYMS = {
-    'ru': {
-        'python': ['питон', 'пайтон', 'основы python', 'программирование на python', 'python курс', 'изучение python'],
-        'backend': ['бэкенд', 'серверная разработка', 'backend разработка', 'создание серверов'],
-        'frontend': ['фронтенд', 'интерфейс', 'веб-разработка', 'дизайн сайтов'],
-        'scratch': ['скретч', 'программирование для детей', 'скретч для начинающих', 'игры на скретч'],
-        'data science': ['данные', 'аналитика данных', 'наука о данных', 'анализ данных', 'data анализ']
-    },
-    'ky': {
-        'python': ['питон', 'пайтон', 'python негиздери', 'python боюнча программалоо', 'python курсу',
-                   'python үйрөнүү'],
-        'backend': ['бэкенд', 'сервердик иштеп чыгуу', 'backend иштеп чыгуу', 'сервер түзүү', 'бекенд'],
-        'frontend': ['фронтенд', 'интерфейс', 'веб-иштеп чыгуу', 'сайттардын дизайны', 'фронтенд'],
-        'scratch': ['скретч', 'балдар үчүн программалоо', 'скретч башталгычтар үчүн', 'скретч менен оюндар'],
-        'data science': ['маалыматтар', 'маалыматтар аналитикасы', 'маалымат илими', 'маалыматтарды талдоо',
-                         'data талдоо']
-    }
-}
+# Google Sheets API setup
+# SCOPES = ['https://www.googleapis.com/auth/spreadsheets.readonly', 'https://www.googleapis.com/auth/documents.readonly']
+SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/documents'] # Добавил 'write' scope, если боту нужно изменять таблицы
 
-# Обновленные сообщения для бота
-MESSAGES = {
-    'ru': {
-        'welcome': "Привет! Я виртуальный менеджер IT Run Academy. Я здесь, чтобы помочь вам узнать о наших курсах и возможностях. Чем могу помочь?",
-        'course_data_error': "Внимание: Не удалось загрузить данные о курсах. Я буду отвечать на основе общих знаний, но точная информация о курсах может быть недоступна.",
-        'openai_connect_error': "Извините, сейчас не могу связаться с сервером. Попробуйте позже.",
-        'openai_rate_limit_error': "Извините, слишком много запросов. Подождите немного.",
-        'openai_auth_error': "Извините, произошла ошибка аутентификации. Сообщите администратору.",
-        'openai_timeout_error': "Извините, запрос к серверу занял слишком много времени. Попробуйте еще раз.",
-        'openai_unknown_error': "Извините, произошла внутренняя ошибка. Попробуйте еще раз или свяжитесь с поддержкой.",
-        'no_course_info_available': "Информация о курсах пока недоступна в полном объеме. Сообщите администратору, чтобы он добавил курсы или уточните позже.",
-        'off_topic_response': "К сожалению, я не могу помочь с этим вопросом, но могу рассказать о наших курсах в IT Run Academy. У нас есть отличные программы, которые могут вас заинтересовать. Хотите, чтобы я рассказала подробнее?",
-        # Новая фраза для записи через форму
-        'enrollment_form_prompt': "Отлично! Чтобы записаться или получить подробную консультацию, пожалуйста, заполните эту форму:[ https://forms.gle/QkyZyuPm1SLdfEa8A ]. Также Вы можете лично посетить нашу академию по адресу: [Адрес академии из базы знаний]. Мы работаем [График работы из базы знаний]. Будем рады Вас видеть!",
-        # Новая фраза для запроса формы при отсутствии информации
-        'no_info_form_prompt': "Извините, у меня нет точной информации по вашему вопросу прямо сейчас, или я не нашла такой курс. Чтобы наши менеджеры могли связаться с вами и предоставить подробную информацию, пожалуйста, заполните эту форму: [ https://forms.gle/QkyZyuPm1SLdfEa8A ].",
-        # Новая фраза для приглашения на пробный урок (GPT будет использовать ее как пример)
-        'trial_lesson_invite': "Также приглашаем вас на наш бесплатный пробный урок, который проводится каждую субботу. Это отличная возможность познакомиться с нами ближе!",
-        'post_consultation_prompt': "Если вы хотите записаться, пожалуйста, скажите об этом.",
-        'cooperation_contact_prompt': "По вопросам сотрудничества или практики, пожалуйста, свяжитесь с нашим менеджером по номеру: [НОМЕР_МЕНЕДЖЕРА_ДЛЯ_СОТРУДНИЧЕСТВА].",
-    },
-    'ky': {
-        'welcome': "Салам! Мен IT Run Academyнин виртуалдык менеджеримин. Мен сизге курстарыбыз жана мүмкүнчүлүктөрүбүз жөнүндө маалымат берүүгө даярмын. Кантип жардам бере алам?",
-        'course_data_error': "Эскертүү: Курстар жөнүндө маалымат жүктөлбөй калды. Мен жалпы билимдин негизинде жооп берем, бирок курстар жөнүндө так маалымат жеткиликсиз болушу мүмкүн.",
-        'openai_connect_error': "Кечиресиз, учурда сервер менен байланша албай жатам. Кийинчерээк кайра аракет кылыңыз.",
-        'openai_rate_limit_error': "Кечиресиз, суроо-талаптар көп. Бир аз күтүңүз.",
-        'openai_auth_error': "Кечиресиз, аутентификация катасы кетти. Администраторго билдириңиз.",
-        'openai_timeout_error': "Кечиресиз, серверге суроо-талап узак убакытты алды. Кайра аракет кылыңыз.",
-        'openai_unknown_error': "Кечиресиз, ички ката кетти. Кайра аракет кылыңыз же колдоо кызматына кайрылыңыз.",
-        'no_course_info_available': "Курстар жөнүндө маалымат толук жеткиликсиз. Администраторго билдириңиз же кийинчерээк тактаңыз.",
-        'off_topic_response': "Кечиресиз, бул суроого жардам бере албайм, бирок IT Run Academyдеги курстарыбыз жөнүндө айта алам. Бизде сизди кызыктыра турган сонун программалар бар. Кененирээк айтып берейинби?",
-        'enrollment_form_prompt': "Абдан сонун! Катталуу же кененирээк кеңеш алуу үчүн, сураныч, бул форманы толтуруңуз: [ https://forms.gle/QkyZyuPm1SLdfEa8A ]. Ошондой эле сиз биздин академияга жеке өзүңүз келип кайрылсаңыз болот: [Академиянын дареги базадан]. Биз [Иш убактысы базадан] иштейбиз. Сизди күтөбүз!",
-        'no_info_form_prompt': "Кечиресиз, учурда менин сурооңуз боюнча так маалыматым жок, же мен андай курсту тапкан жокмун. Биздин менеджерлер сизге байланышып, толук маалымат бере алышы үчүн, сураныч, бул форманы толтуруңуз: [ https://forms.gle/QkyZyuPm1SLdfEa8A ].",
-        'trial_lesson_invite': "Ошондой эле сизди ар ишемби сайын өтүүчү акысыз сыноо сабагыбызга чакырабыз. Бул биз менен жакындан таанышууга эң сонун мүмкүнчүлүк!",
-        'post_consultation_prompt': "Эгер сиз жазылгыңыз келсе, айтыңыз.",
-        'cooperation_contact_prompt': "Кызматташуу же практика боюнча суроолор үчүн, биздин менеджер менен бул номер аркылуу байланышыңыз: [НОМЕР_МЕНЕДЖЕРА_ДЛЯ_СОТРУДНИЧЕСТВА].",
-    }
-}
+# Проверяем, есть ли переменная окружения GOOGLE_SERVICE_ACCOUNT_KEY
+# Если есть, используем ее содержимое. Иначе - ищем файл (только для локальной разработки).
+service_account_info_json = os.getenv('GOOGLE_SERVICE_ACCOUNT_KEY')
 
+if service_account_info_json:
+    try:
+        service_account_info = json.loads(service_account_info_json)
+        creds = Credentials.from_service_account_info(service_account_info, scopes=SCOPES)
+        logger.info("Credentials loaded from GOOGLE_SERVICE_ACCOUNT_KEY environment variable.")
+    except json.JSONDecodeError as e:
+        logger.critical(f"Error decoding GOOGLE_SERVICE_ACCOUNT_KEY JSON: {e}")
+        sys.exit(1) # Выходим, если не можем загрузить ключ
+else:
+    # Этот блок будет выполняться ТОЛЬКО при локальном запуске, если GOOGLE_SERVICE_ACCOUNT_KEY не установлена
+    SERVICE_ACCOUNT_FILE = 'service_account_key.json' # Здесь можно оставить, если для локальной разработки
+    try:
+        creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
+        logger.info("Credentials loaded from local service_account_key.json file.")
+    except FileNotFoundError:
+        logger.critical("Error: service_account_key.json not found and GOOGLE_SERVICE_ACCOUNT_KEY environment variable not set. Bot cannot start.")
+        sys.exit(1) # Выходим, если не можем загрузить ключ
 
-def get_knowledge_base(lang_code):
-    """Синхронная функция для загрузки базы знаний из Google Docs."""
-    doc = docs_service.documents().get(documentId=GOOGLE_DOC_ID).execute()
-    content = doc.get("body").get("content")
-    text = ""
-    for element in content:
-        if "paragraph" in element:
-            for text_run in element["paragraph"]["elements"]:
-                if "textRun" in text_run:
-                    text += text_run["textRun"]["content"]
-    knowledge_base_cache[lang_code] = text
-    return text
+# Инициализация gspread
+gc = gspread.authorize(creds)
+# Инициализация Google Docs API
+docs_service = build('docs', 'v1', credentials=creds)
 
+# Глобальные переменные для хранения данных (кэш)
+courses_data = {}
+knowledge_base_data = {}
+last_cache_update = None # Время последнего обновления кэша
 
-async def refresh_cache():
-    global last_cache_update
-    if datetime.now() - last_cache_update > CACHE_LIFETIME:
-        logger.info("Обновление кэша: загрузка курсов и базы знаний.")
-        await asyncio.to_thread(load_courses_from_sheets)
-        for lang in ['ru', 'ky']:
-            knowledge_base_cache[lang] = await asyncio.to_thread(get_knowledge_base, lang)
-        last_cache_update = datetime.now()
-        logger.info("Кэш успешно обновлен.")
-    else:
-        logger.info("Кэш актуален, обновление не требуется.")
-
-
-async def refresh_cache_job(context: ContextTypes.DEFAULT_TYPE):
-    logger.info("Плановое обновление кэша...")
-    await refresh_cache()
-    logger.info("Плановое обновление кэша завершено.")
-
+# --- Функции для работы с Google Sheets и Docs ---
 
 def load_courses_from_sheets():
-    """Синхронная функция для загрузки курсов из Google Sheets."""
-    global course_cache
+    """Загружает данные о курсах из Google Sheets."""
     try:
-        records = sheet_courses.get_all_records()
-        courses_ru, courses_ky = [], []
-        for record in records:
-            course_ru_name = record.get('Название курса', '').strip()
-            if course_ru_name:
-                courses_ru.append({
-                    'Название курса': course_ru_name,
-                    'Описание': record.get('Описание', 'Описание отсутствует.'),
-                    'Цена / на месяц': record.get('Цена / на месяц', 'Цена не указана.'),
-                    'Продолжительность': record.get('Продолжительность', 'Продолжительность не указана.'),
-                    'график учебы': record.get('график учебы', 'График не указан.'),
-                    'возрастное ограничение': record.get('возрастное ограничение', 'Возраст не указан.')
-                })
-            course_ky_name = record.get('Название курса (Кырг.)', course_ru_name).strip()
-            if course_ky_name:
-                courses_ky.append({
-                    'Название курса': course_ky_name,
-                    'Описание': record.get('Описание (Кырг.)', record.get('Описание', 'Сүрөттөмө жок.')),
-                    'Цена / на месяц': record.get('Цена / на месяц', 'Баасы көрсөтүлгөн эмес.'),
-                    'Продолжительность': record.get('Продолжительность', 'Узактыгы көрсөтүлгөн эмес.'),
-                    'график учебы': record.get('график учебы (Кырг.)',
-                                               record.get('график учебы', 'График көрсөтүлгөн эмес.')),
-                    'возрастное ограничение': record.get('возрастное ограничение (Кырг.)',
-                                                         record.get('возрастное ограничение', 'Жашы көрсөтүлгөн эмес.'))
-                })
-        course_cache['ru'] = courses_ru
-        course_cache['ky'] = courses_ky
-        logger.info(f"Загружено {len(courses_ru)} курсов для RU и {len(courses_ky)} для KY из Google Sheets.")
+        worksheet = gc.open_by_id(SHEET_ID_COURSES).worksheet("Наши курсы")
+        records = worksheet.get_all_records()
+        global courses_data
+        courses_data = {row['Курс'].lower(): row for row in records}
+        logger.info("Данные о курсах успешно загружены.")
     except Exception as e:
-        logger.error(f"Ошибка при загрузке курсов из Google Sheets: {str(e)}")
-        pass
+        logger.error(f"Ошибка загрузки данных о курсах из Google Sheets: {e}")
+        raise
 
-
-def get_system_prompt(lang_code):
-    knowledge_base = knowledge_base_cache.get(lang_code, '')
-    if not knowledge_base:
-        logger.warning(f"База знаний для языка {lang_code} пуста в кэше. Попытка загрузки.")
-        knowledge_base = get_knowledge_base(lang_code)
-        if not knowledge_base:
-            logger.error(f"Не удалось загрузить базу знаний для языка {lang_code}.")
-            knowledge_base = "Информация об академии временно недоступна."
-
-    courses = course_cache.get(lang_code, [])
-    courses_str = "\n".join([
-        f"- {c['Название курса']}: {c.get('Описание', 'Описание отсутствует.')}, "
-        f"Цена: {c.get('Цена / на месяц', 'Цена не указана.')}, "
-        f"Продолжительность: {c.get('Продолжительность', 'Продолжительность не указана.')}, "
-        f"График учебы: {c.get('график учебы', 'График не указан.')}, "
-        f"Возрастное ограничение: {c.get('возрастное ограничение', 'Возраст не указан.')}"
-        for c in courses
-    ])
-    if not courses:
-        courses_str = MESSAGES[lang_code]['no_course_info_available']
-        logger.warning(f"Информация о курсах для языка {lang_code} пуста в кэше.")
-
-    off_topic_response_example = MESSAGES[lang_code]['off_topic_response']
-    enrollment_form_prompt_example = MESSAGES[lang_code]['enrollment_form_prompt']
-    no_info_form_prompt_example = MESSAGES[lang_code]['no_info_form_prompt']
-    trial_lesson_invite_example = MESSAGES[lang_code]['trial_lesson_invite']
-    post_consultation_prompt_example = MESSAGES[lang_code]['post_consultation_prompt']
-    cooperation_contact_prompt_example = MESSAGES[lang_code]['cooperation_contact_prompt']
-
-    prompt_file_path = f"system_prompt_{lang_code}.txt"
+def get_knowledge_base(lang='ru'):
+    """Загружает базу знаний из Google Docs."""
     try:
-        with open(prompt_file_path, 'r', encoding='utf-8') as f:
-            base_prompt = f.read()
-    except FileNotFoundError:
-        logger.error(f"Файл промпта не найден: {prompt_file_path}. Используется резервный промпт.")
-        base_prompt = (
-            "You are an IT Run Academy virtual manager. Provide information about courses and academy. "
-            "Use provided knowledge base and course info. If information is missing, ask to fill the form."
-        )
+        doc_content = docs_service.documents().get(documentId=DOC_ID).execute()
+        full_text = ""
+        # Проходим по всем элементам тела документа
+        for element in doc_content.get('body').get('content'):
+            # Проверяем, есть ли параграфы
+            if 'paragraph' in element:
+                # Проходим по всем текстовым элементам в параграфе
+                for text_run in element.get('paragraph').get('elements'):
+                    if 'textRun' in text_run:
+                        # Добавляем текст
+                        full_text += text_run.get('textRun').get('content')
 
+        # Разделяем на секции по ключевым словам для русского и кыргызского
+        if lang == 'ru':
+            start_marker = "База знаний:\n"
+            end_marker = "Доступные курсы:\n"
+            start_index = full_text.find(start_marker)
+            end_index = full_text.find(end_marker, start_index + len(start_marker))
+            if start_index != -1 and end_index != -1:
+                kb_text = full_text[start_index + len(start_marker):end_index].strip()
+            else:
+                kb_text = full_text.strip() # Если маркеры не найдены, берем весь текст
+            knowledge_base_data['ru'] = kb_text
+            logger.info(f"База знаний RU успешно загружена. Длина: {len(kb_text)} символов.")
+
+        elif lang == 'ky':
+            start_marker = "База знаний:\n" # Возможно, другие маркеры для кыргызского?
+            end_marker = "Доступные курсы:\n" # Или другие
+            start_index = full_text.find(start_marker)
+            end_index = full_text.find(end_marker, start_index + len(start_marker))
+            if start_index != -1 and end_index != -1:
+                kb_text = full_text[start_index + len(start_marker):end_index].strip()
+            else:
+                kb_text = full_text.strip() # Если маркеры не найдены, берем весь текст
+            knowledge_base_data['ky'] = kb_text
+            logger.info(f"База знаний KY успешно загружена. Длина: {len(kb_text)} символов.")
+
+    except Exception as e:
+        logger.error(f"Ошибка загрузки базы знаний из Google Docs для языка {lang}: {e}")
+        raise
+
+async def refresh_cache():
+    """Обновляет кэш данных из Google Sheets и Docs."""
+    global last_cache_update
+    if last_cache_update is None or (datetime.now() - last_cache_update) > timedelta(hours=1):
+        logger.info("Обновление кэша данных...")
+        try:
+            load_courses_from_sheets()
+            for lang in ['ru', 'ky']:
+                get_knowledge_base(lang)
+            last_cache_update = datetime.now()
+            logger.info("Кэш данных успешно обновлен.")
+        except Exception as e:
+            logger.error(f"Ошибка при обновлении кэша: {e}")
+
+# --- Функции для работы с OpenAI ---
+
+def generate_response(prompt, lang='ru'):
+    """Генерирует ответ с помощью OpenAI."""
     try:
-        prompt = base_prompt.format(
-            knowledge_base=knowledge_base,
-            courses_str=courses_str,
-            off_topic_response_example=off_topic_response_example,
-            enrollment_form_prompt_example=enrollment_form_prompt_example,
-            no_info_form_prompt_example=no_info_form_prompt_example,
-            trial_lesson_invite_example=trial_lesson_invite_example,
-            post_consultation_prompt_example=post_consultation_prompt_example,
-            cooperation_contact_prompt_example=cooperation_contact_prompt_example
-        )
-    except KeyError as e:
-        logger.error(
-            f"Ошибка форматирования промпта для языка {lang_code}: не найден ключ {e}. Проверьте файл промпта.")
-        prompt = (
-            "You are an IT Run Academy virtual manager. Provide information about courses and academy. "
-            f"Knowledge Base: {knowledge_base}\nCourses: {courses_str}\n"
-            "If information is missing, ask to fill the form."
-        )
-    return prompt
-
-
-async def get_gpt_response(user_message, chat_history, lang_code):
-    messages = [{"role": "system", "content": get_system_prompt(lang_code)}]
-    messages.extend(chat_history)
-
-    MAX_HISTORY_LENGTH = 10
-    if len(messages) > MAX_HISTORY_LENGTH + 1:
-        messages = [messages[0]] + messages[-(MAX_HISTORY_LENGTH):]
-
-    messages.append({"role": "user", "content": user_message})
-
-    logger.info(f"Сообщения для GPT: {messages}")
-
-    try:
-        response = await asyncio.to_thread(
-            openai_client.chat.completions.create,
-            model="gpt-4o",
-            messages=messages,
-            max_tokens=500,
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo", # Или "gpt-4-turbo" если есть доступ
+            messages=[
+                {"role": "system", "content": open(f'system_prompt_{lang}.txt', 'r', encoding='utf-8').read().format(
+                    knowledge_base=knowledge_base_data.get(lang, ''),
+                    courses_str="\n".join([f"- {k}: {v['Описание']}" for k, v in courses_data.items()]),
+                    post_consultation_prompt_example="Готовы ли вы начать обучение с IT Run Academy?"
+                )},
+                {"role": "user", "content": prompt}
+            ],
             temperature=0.7
         )
-        return response.choices[0].message.content
+        return response.choices[0].message.content.strip()
     except Exception as e:
-        logger.error(f"Ошибка OpenAI: {str(e)}", exc_info=True)
-        if "rate limit" in str(e).lower():
-            return MESSAGES[lang_code]['openai_rate_limit_error']
-        elif "authentication error" in str(e).lower() or "invalid api key" in str(e).lower():
-            return MESSAGES[lang_code]['openai_auth_error']
-        elif "timeout" in str(e).lower():
-            return MESSAGES[lang_code]['openai_timeout_error']
-        return MESSAGES[lang_code]['openai_unknown_error']
+        logger.error(f"Ошибка генерации ответа OpenAI: {e}")
+        return f"Извините, произошла ошибка при обработке вашего запроса ({e}). Пожалуйста, попробуйте еще раз."
 
+# --- Функции для работы с Telegram API ---
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await refresh_cache()
-    lang_code = detect_language(update.message.text)
-    context.user_data['lang'] = lang_code
-    context.user_data['chat_history'] = []
-    logger.info(f"Запуск команды /start для пользователя {update.effective_user.id}, язык: {lang_code}")
-    await update.message.reply_text(MESSAGES[lang_code]['welcome'])
+    """Обрабатывает команду /start."""
+    user_name = update.effective_user.first_name if update.effective_user else "пользователь"
+    await update.message.reply_text(f"Привет, {user_name}! Я бот IT Run Academy. Спрашивайте меня о курсах и нашей академии.")
+    logger.info(f"Получена команда /start от {user_name}.")
 
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE, message_text: str = None):
-    # Если message_text передан (например, из голосового сообщения), используем его.
-    # В противном случае, используем текст из update.message.
-    user_message = message_text if message_text is not None else update.message.text.strip()
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает текстовые сообщения."""
+    await refresh_cache() # Обновляем кэш при каждом сообщении (или по таймеру)
+    user_text = update.message.text
     user_id = update.effective_user.id
+    logger.info(f"Получено сообщение от {user_id}: {user_text}")
 
-    # Определяем язык, используя либо уже установленный в user_data, либо детектируя из сообщения
-    lang_code = context.user_data.get('lang', detect_language(user_message))
-    logger.info(f"Обработка сообщения от {user_id}: '{user_message}', язык: {lang_code}")
-
-    if 'chat_history' not in context.user_data:
-        context.user_data['chat_history'] = []
-    if 'lang' not in context.user_data:
-        context.user_data['lang'] = lang_code
-
-    chat_history = context.user_data.get('chat_history', [])
-    chat_history.append({"role": "user", "content": user_message})
-
-    await update.message.reply_chat_action("typing")
-
-    response_text = await get_gpt_response(user_message, chat_history, lang_code)
-    chat_history.append({"role": "assistant", "content": response_text})
-    context.user_data['chat_history'] = chat_history
-
+    detected_lang = detect_language(user_text)
+    response_text = generate_response(user_text, lang=detected_lang)
     await update.message.reply_text(response_text)
 
-
-
-# НОВЫЙ ХЕНДЛЕР ДЛЯ ГОЛОСОВЫХ СООБЩЕНИЙ
 async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает голосовые сообщения."""
+    await refresh_cache() # Обновляем кэш при каждом сообщении (или по таймеру)
     user_id = update.effective_user.id
     voice_file_id = update.message.voice.file_id
-    logger.info(f"Получено голосовое сообщение от {user_id}, file_id: {voice_file_id}")
+    logger.info(f"Получено голосовое сообщение от {user_id}. File ID: {voice_file_id}")
 
-    await update.message.reply_chat_action("typing")
-
-    ogg_path = None
-    mp3_path = None
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as temp_ogg_file:
-            ogg_path = temp_ogg_file.name
-            voice_file = await context.bot.get_file(voice_file_id)
-            await voice_file.download_to_drive(ogg_path)
-        logger.info(f"Голосовое сообщение сохранено во временный файл: {ogg_path}")
+        # Скачиваем голосовое сообщение
+        file = await context.bot.get_file(voice_file_id)
+        # Используем tempfile для безопасной работы с временными файлами
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ogg_path = os.path.join(tmpdir, f"{voice_file_id}.ogg")
+            wav_path = os.path.join(tmpdir, f"{voice_file_id}.wav")
 
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp_mp3_file:
-            mp3_path = temp_mp3_file.name
-            try:
-                audio = AudioSegment.from_file(ogg_path, format="ogg")
-                audio.export(mp3_path, format="mp3")
-                logger.info(f"Голосовое сообщение конвертировано в MP3: {mp3_path}")
-            except Exception as e:
-                logger.error(f"Ошибка конвертации OGG в MP3 с помощью pydub/ffmpeg: {e}", exc_info=True)
-                await update.message.reply_text(
-                    "Извините, произошла ошибка при обработке аудио. Пожалуйста, попробуйте еще раз или напишите мне.")
+            await file.download_to_drive(ogg_path)
+            logger.info(f"Голосовое сообщение сохранено как {ogg_path}")
+
+            # Конвертируем OGG в WAV с помощью pydub
+            # Это требует FFmpeg. Убедитесь, что FFmpeg установлен и доступен.
+            audio = AudioSegment.from_ogg(ogg_path)
+            audio.export(wav_path, format="wav")
+            logger.info(f"Голосовое сообщение сконвертировано в {wav_path}")
+
+            # Отправляем аудио на транскрибацию в OpenAI Whisper
+            with open(wav_path, "rb") as audio_file:
+                transcript = client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=audio_file,
+                    response_format="text"
+                )
+            user_text = transcript.strip()
+            logger.info(f"Транскрибированный текст: {user_text}")
+
+            if not user_text:
+                await update.message.reply_text("Не удалось распознать речь. Пожалуйста, попробуйте еще раз или напишите текст.")
                 return
 
-                # ... (код до этого места остается без изменений) ...
-
-            with open(mp3_path, "rb") as audio_file:
-                    transcription_response = await asyncio.to_thread(
-                        openai_client.audio.transcriptions.create,
-                        model="whisper-1",
-                        file=audio_file,
-                        response_format="text",
-                        # УДАЛИТЕ language="ru" или language="ky" ЕСЛИ ОНО ТАМ ЕЩЕ ЕСТЬ
-                        # ДОБАВЬТЕ ПАРАМЕТР PROMPT С КЫРГЫЗСКИМИ И РУССКИМИ СЛОВАМИ
-                        prompt="Салам алейкум, курстар, Python, Backend, Frontend, Scratch, IT Run Academy, Жалал-Абад, салам, жакшы, рахмат, программирование, курс, как дела, здравствуйте, до свидания"
-                    )
-
-            user_message_text = transcription_response.strip()
-            logger.info(f"Голосовое сообщение транскрибировано в текст: '{user_message_text}'")
-
-        # ... (остальной код handle_voice_message без изменений) ...
-
-        if not user_message_text:
-            await update.message.reply_text(
-                "Извините, не удалось распознать речь в вашем сообщении. Пожалуйста, повторите или напишите мне.")
-            return
-
-        # *** ВАЖНОЕ ИЗМЕНЕНИЕ: Обновляем язык в user_data на основе распознанного текста ***
-        detected_lang = detect_language(user_message_text)
-        context.user_data['lang'] = detected_lang # Перезаписываем язык в контексте пользователя
-        logger.info(f"Язык для ответа установлен на: {detected_lang} (на основе голосового сообщения)")
-
-
-        # Передаем распознанный текст в существующий обработчик текстовых сообщений
-        await handle_message(update, context, message_text=user_message_text)
+            detected_lang = detect_language(user_text)
+            response_text = generate_response(user_text, lang=detected_lang)
+            await update.message.reply_text(response_text)
 
     except Exception as e:
-        logger.exception("Ошибка при обработке голосового сообщения:")
-        await update.message.reply_text(
-            "Извините, произошла ошибка при обработке вашего голосового сообщения. Пожалуйста, попробуйте еще раз или напишите мне.")
-    finally:
-        if ogg_path and os.path.exists(ogg_path):
-            os.remove(ogg_path)
-            logger.info(f"Временный файл удален: {ogg_path}")
-        if mp3_path and os.path.exists(mp3_path):
-            os.remove(mp3_path)
-            logger.info(f"Временный файл удален: {mp3_path}")
+        logger.error(f"Ошибка обработки голосового сообщения: {e}", exc_info=True)
+        await update.message.reply_text("Извините, произошла ошибка при обработке голосового сообщения. Пожалуйста, попробуйте еще раз.")
 
 
-
+# --- Вспомогательные функции ---
 
 def detect_language(text):
+    """
+    Определяет язык текста (русский или кыргызский) на основе наличия кыргызских букв
+    или ключевых слов.
+    """
     text_lower = text.lower()
-    kyrgyz_keywords = [
-        'ооба', 'жок', 'салам', 'жазылайын', 'катталуу', 'тиркеме', 'кабыл алуу', 'кантип', 'эмне',
-        'ким', 'бекенд', 'фронтенд', 'графолог', 'мобилография', 'орт', 'программист', 'баасы', 'узактыгы', 'графиги'
-    ]
+    kyrgyz_letters = "өңүчзг" # Простые кыргызские буквы для быстрого определения
+    kyrgyz_keywords = ["саламатсызбы", "рахмат", "кечиресиз", "кандай", "рахмат", "жок"] # Более полные слова
 
-    kyrgyz_chars = "ңөү"
-    if any(char in text_lower for char in kyrgyz_chars):
+    # Проверка на наличие уникальных кыргызских букв
+    if any(char in text_lower for char in kyrgyz_letters):
         logger.info(f"Язык определен как KY (по кыргызским буквам): '{text}'")
         return 'ky'
 
@@ -437,15 +292,9 @@ def main():
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.add_handler(MessageHandler(filters.VOICE, handle_voice_message))  # Хендлер для голосовых сообщений
-
-    application.job_queue.run_repeating(refresh_cache_job, interval=timedelta(minutes=20), first=0)
+    application.add_handler(MessageHandler(filters.VOICE, handle_voice_message)) # Добавляем обработчик для голосовых сообщений
 
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
-
-
-

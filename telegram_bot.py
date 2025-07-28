@@ -17,11 +17,21 @@ import functools
 import tempfile  # Для создания временных файлов
 from pydub import AudioSegment  # Для работы с аудиофайлами, требует ffmpeg
 
+import signal
+
+def signal_handler(sig, frame):
+    logger.info('Получен сигнал завершения, останавливаем бот...')
+    sys.exit(0)
+
+# Регистрируем обработчики сигналов
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
 # Убедитесь, что pydub установлен: pip install pydub
 # И что ffmpeg установлен в вашей системе и доступен в PATH
 # Путь к FFmpeg. Убедитесь, что это ПРАВИЛЬНЫЙ путь к папке 'bin' вашего FFmpeg.
 # Например: r"C:\ffmpeg\bin" или r"C:\Users\NoutSpace\Desktop\ffmpeg-master-latest-win64-gpl-shared\bin"
-os.environ["PATH"] += os.pathsep + r"C:\ffmpeg\bin"  # <-- УКАЖИТЕ АКТУАЛЬНЫЙ ПУТЬ К ВАШЕМУ BIN FFmpeg
+# os.environ["PATH"] += os.pathsep + r"C:\ffmpeg\bin"  # <-- УКАЖИТЕ АКТУАЛЬНЫЙ ПУТЬ К ВАШЕМУ BIN FFmpeg
 
 # Настройка логирования
 logging.basicConfig(
@@ -40,7 +50,23 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_SHEET_COURSES_ID = os.getenv("SHEET_ID_COURSES", "1XeTe3Ihvi2N8bvo6P-yBZL2j_8L2IlvN6bOPYmCu5z8")
 GOOGLE_DOC_ID = os.getenv("DOC_ID")
 
+# Обработка Google Service Account для Railway
 SERVICE_ACCOUNT_FILE = 'service_account_key.json'
+
+def setup_google_credentials():
+    """Настройка Google credentials для Railway"""
+    service_account_json = os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON')
+    if service_account_json:
+        # Создаем файл из переменной окружения
+        with open(SERVICE_ACCOUNT_FILE, 'w', encoding='utf-8') as f:
+            f.write(service_account_json)
+        logger.info("Google Service Account создан из переменной окружения")
+    elif not os.path.exists(SERVICE_ACCOUNT_FILE):
+        logger.error("Google Service Account файл не найден!")
+        raise FileNotFoundError("service_account_key.json не найден")
+
+# Вызовите эту функцию в начале
+setup_google_credentials()
 
 try:
     openai_client = OpenAI(api_key=OPENAI_API_KEY)
@@ -96,9 +122,7 @@ MESSAGES = {
         'no_info_form_prompt': "Извините, у меня нет точной информации по вашему вопросу прямо сейчас, или я не нашла такой курс. Чтобы наши менеджеры могли связаться с вами и предоставить подробную информацию, пожалуйста, заполните эту форму: [ https://forms.gle/QkyZyuPm1SLdfEa8A ].",
         # Новая фраза для приглашения на пробный урок (GPT будет использовать ее как пример)
         'trial_lesson_invite': "Также приглашаем вас на наш бесплатный пробный урок, который проводится каждую субботу. Это отличная возможность познакомиться с нами ближе!",
-        # Новая фраза для вопроса после консультации
         'post_consultation_prompt': "Если вы хотите записаться, пожалуйста, скажите об этом.",
-        # Новая фраза для ответа на вопросы о сотрудничестве/практике
         'cooperation_contact_prompt': "По вопросам сотрудничества или практики, пожалуйста, свяжитесь с нашим менеджером по номеру: [НОМЕР_МЕНЕДЖЕРА_ДЛЯ_СОТРУДНИЧЕСТВА].",
     },
     'ky': {
@@ -320,28 +344,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE, mes
     await update.message.reply_text(response_text)
 
 
+
 # НОВЫЙ ХЕНДЛЕР ДЛЯ ГОЛОСОВЫХ СООБЩЕНИЙ
 async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     voice_file_id = update.message.voice.file_id
     logger.info(f"Получено голосовое сообщение от {user_id}, file_id: {voice_file_id}")
 
-    # Используем typing, так как это более общий индикатор обработки
     await update.message.reply_chat_action("typing")
-    await update.message.reply_text("Пожалуйста, подождите, я анализирую ваше голосовое сообщение...",
-                                    disable_notification=True)
 
     ogg_path = None
     mp3_path = None
     try:
-        # Создаем временный файл для сохранения аудио Telegram (обычно OGG)
         with tempfile.NamedTemporaryFile(delete=False, suffix=".ogg") as temp_ogg_file:
             ogg_path = temp_ogg_file.name
             voice_file = await context.bot.get_file(voice_file_id)
             await voice_file.download_to_drive(ogg_path)
         logger.info(f"Голосовое сообщение сохранено во временный файл: {ogg_path}")
 
-        # Создаем временный файл для конвертированного MP3
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp_mp3_file:
             mp3_path = temp_mp3_file.name
             try:
@@ -352,44 +372,53 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 logger.error(f"Ошибка конвертации OGG в MP3 с помощью pydub/ffmpeg: {e}", exc_info=True)
                 await update.message.reply_text(
                     "Извините, произошла ошибка при обработке аудио. Пожалуйста, попробуйте еще раз или напишите мне.")
-                return  # Прерываем выполнение, если конвертация не удалась
+                return
 
-        # Отправляем аудио в OpenAI Whisper для транскрибации
-        with open(mp3_path, "rb") as audio_file:
-            transcription_response = await asyncio.to_thread(
-                openai_client.audio.transcriptions.create,
-                model="whisper-1",
-                file=audio_file,
-                response_format="text",  # Получаем чистый текст
-                language="ru"  # Указываем язык для лучшего качества распознавания
-            )
+                # ... (код до этого места остается без изменений) ...
 
-        user_message_text = transcription_response.strip()
-        logger.info(f"Голосовое сообщение транскрибировано в текст: '{user_message_text}'")
+            with open(mp3_path, "rb") as audio_file:
+                    transcription_response = await asyncio.to_thread(
+                        openai_client.audio.transcriptions.create,
+                        model="whisper-1",
+                        file=audio_file,
+                        response_format="text",
+                        # УДАЛИТЕ language="ru" или language="ky" ЕСЛИ ОНО ТАМ ЕЩЕ ЕСТЬ
+                        # ДОБАВЬТЕ ПАРАМЕТР PROMPT С КЫРГЫЗСКИМИ И РУССКИМИ СЛОВАМИ
+                        prompt="Салам алейкум, курстар, Python, Backend, Frontend, Scratch, IT Run Academy, Жалал-Абад, салам, жакшы, рахмат, программирование, курс, как дела, здравствуйте, до свидания"
+                    )
 
-        # Если текст пустой, сообщаем об этом
+            user_message_text = transcription_response.strip()
+            logger.info(f"Голосовое сообщение транскрибировано в текст: '{user_message_text}'")
+
+        # ... (остальной код handle_voice_message без изменений) ...
+
         if not user_message_text:
             await update.message.reply_text(
                 "Извините, не удалось распознать речь в вашем сообщении. Пожалуйста, повторите или напишите мне.")
             return
 
+        # *** ВАЖНОЕ ИЗМЕНЕНИЕ: Обновляем язык в user_data на основе распознанного текста ***
+        detected_lang = detect_language(user_message_text)
+        context.user_data['lang'] = detected_lang # Перезаписываем язык в контексте пользователя
+        logger.info(f"Язык для ответа установлен на: {detected_lang} (на основе голосового сообщения)")
+
+
         # Передаем распознанный текст в существующий обработчик текстовых сообщений
-        # ВАЖНО: handle_message теперь принимает message_text в качестве опционального аргумента
         await handle_message(update, context, message_text=user_message_text)
 
     except Exception as e:
-        logger.exception(
-            "Ошибка при обработке голосового сообщения:")  # Используем logger.exception для полного трейсбека
+        logger.exception("Ошибка при обработке голосового сообщения:")
         await update.message.reply_text(
             "Извините, произошла ошибка при обработке вашего голосового сообщения. Пожалуйста, попробуйте еще раз или напишите мне.")
     finally:
-        # Очистка временных файлов
         if ogg_path and os.path.exists(ogg_path):
             os.remove(ogg_path)
             logger.info(f"Временный файл удален: {ogg_path}")
         if mp3_path and os.path.exists(mp3_path):
             os.remove(mp3_path)
             logger.info(f"Временный файл удален: {mp3_path}")
+
+
 
 
 def detect_language(text):
@@ -439,3 +468,6 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+
